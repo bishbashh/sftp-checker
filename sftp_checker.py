@@ -3,6 +3,11 @@
 SFTP Checker - Connect via proxy and list directories.
 Mirrors the FileZilla "Generic proxy" + "SFTP site" setup.
 
+Steps:
+  1. Try direct SFTP connection (no proxy)
+  2. If direct fails → try via proxy
+  3. List directories on success
+
 Requirements:
     pip install paramiko PySocks
 
@@ -64,8 +69,108 @@ def secret_inp(label: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def try_sftp_direct(sftp_host, sftp_port, sftp_user, sftp_pass, timeout=10):
+    """Attempt a direct SFTP connection (no proxy). Returns (success, entries|None)."""
+    print(f"  [..] Trying direct connection to {sftp_host}:{sftp_port}...", end=" ", flush=True)
+    try:
+        raw_sock = socket.create_connection((sftp_host, sftp_port), timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        print(f"FAIL ({e})")
+        return False, None
+
+    transport = paramiko.Transport(raw_sock)
+    transport.banner_timeout = timeout
+    transport.auth_timeout   = timeout
+    try:
+        transport.connect(username=sftp_user, password=sftp_pass)
+    except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+        print(f"FAIL ({e})")
+        raw_sock.close()
+        return False, None
+
+    print("OK  ✓  (no proxy needed!)")
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    try:
+        entries = sftp.listdir_attr(".")
+    finally:
+        sftp.close()
+        transport.close()
+    return True, entries
+
+
+def try_sftp_via_proxy(
+    proxy_label, proxy_type,
+    proxy_host, proxy_port, proxy_user, proxy_pass,
+    sftp_host,  sftp_port,  sftp_user,  sftp_pass,
+    timeout=20,
+):
+    """Attempt SFTP connection through proxy. Returns (success, entries|None)."""
+    print(f"  [..] Opening proxy tunnel [{proxy_label}] {proxy_host}:{proxy_port}...",
+          end=" ", flush=True)
+    sock = socks.socksocket()
+    sock.set_proxy(proxy_type, proxy_host, proxy_port, True,
+                   proxy_user or None, proxy_pass or None)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((sftp_host, sftp_port))
+    except socks.ProxyConnectionError as e:
+        print(f"FAIL (cannot reach proxy: {e})")
+        return False, None
+    except socks.GeneralProxyError as e:
+        print(f"FAIL (proxy rejected: {e})")
+        return False, None
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        print(f"FAIL (socket: {e})")
+        return False, None
+    print("OK")
+
+    print("  [..] SSH handshake...", end=" ", flush=True)
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = timeout
+    transport.auth_timeout   = timeout
+    try:
+        transport.connect(username=sftp_user, password=sftp_pass)
+    except paramiko.AuthenticationException:
+        print("FAIL (wrong username or password)")
+        transport.close()
+        return False, None
+    except paramiko.SSHException as e:
+        print(f"FAIL (SSH: {e})")
+        transport.close()
+        return False, None
+    print("OK")
+
+    print("  [..] Opening SFTP channel...", end=" ", flush=True)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    print("OK")
+    try:
+        entries = sftp.listdir_attr(".")
+    finally:
+        sftp.close()
+        transport.close()
+    return True, entries
+
+
+def print_listing(entries, method: str):
+    section(f"Remote directory listing  (via {method})")
+    print()
+    if not entries:
+        print("  (empty directory)")
+        return
+    entries.sort(key=lambda e: (not bool(e.st_mode and e.st_mode & 0o40000),
+                                e.filename.lower()))
+    col_w = max(len(e.filename) for e in entries) + 2
+    print(f"  {'TYPE':<5}  {'SIZE':>12}  {'NAME'}")
+    print(f"  {'─'*5}  {'─'*12}  {'─'*col_w}")
+    for e in entries:
+        is_dir = bool(e.st_mode and e.st_mode & 0o40000)
+        ftype  = "DIR"  if is_dir else "FILE"
+        sz     = "-"   if is_dir else f"{e.st_size:,}"
+        print(f"  {ftype:<5}  {sz:>12}  {e.filename}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def gather_interactive():
-    """Prompt the user for all credentials (interactive mode)."""
     print()
     print("╔══════════════════════════════════════════════════╗")
     print("║          SFTP Checker  (FileZilla style)         ║")
@@ -95,101 +200,17 @@ def gather_interactive():
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def connect_and_list(
-    proxy_label, proxy_type,
-    proxy_host, proxy_port, proxy_user, proxy_pass,
-    sftp_host,  sftp_port,  sftp_user,  sftp_pass,
-):
-    section("Connecting")
-    print()
-    print(f"  Proxy  : [{proxy_label}]  {proxy_host}:{proxy_port}"
-          + (f"  user={proxy_user}" if proxy_user else ""))
-    print(f"  Target : {sftp_host}:{sftp_port}  user={sftp_user}")
-    print()
-
-    # 1. Proxied socket ────────────────────────────────────────────────────────
-    sock = socks.socksocket()
-    sock.set_proxy(proxy_type, proxy_host, proxy_port, True,
-                   proxy_user or None, proxy_pass or None)
-    sock.settimeout(20)
-
-    print("  [..] Opening proxy tunnel...", end=" ", flush=True)
-    try:
-        sock.connect((sftp_host, sftp_port))
-    except socks.ProxyConnectionError as e:
-        print(f"\n  [FAIL] Cannot reach proxy: {e}")
-        return False
-    except socks.GeneralProxyError as e:
-        print(f"\n  [FAIL] Proxy rejected tunnel: {e}")
-        return False
-    except (socket.timeout, ConnectionRefusedError, OSError) as e:
-        print(f"\n  [FAIL] Socket error: {e}")
-        return False
-    print("OK")
-
-    # 2. SSH transport ─────────────────────────────────────────────────────────
-    print("  [..] SSH handshake...", end=" ", flush=True)
-    transport = paramiko.Transport(sock)
-    transport.banner_timeout = 20
-    transport.auth_timeout   = 20
-    try:
-        transport.connect(username=sftp_user, password=sftp_pass)
-    except paramiko.AuthenticationException:
-        print("\n  [FAIL] Authentication failed – wrong username or password")
-        transport.close()
-        return False
-    except paramiko.SSHException as e:
-        print(f"\n  [FAIL] SSH error: {e}")
-        transport.close()
-        return False
-    print("OK")
-
-    # 3. SFTP listing ──────────────────────────────────────────────────────────
-    print("  [..] Opening SFTP channel...", end=" ", flush=True)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-    print("OK")
-
-    try:
-        section("Remote directory listing")
-        print()
-        entries = sftp.listdir_attr(".")
-        if not entries:
-            print("  (empty directory)")
-        else:
-            entries.sort(key=lambda e: (not bool(e.st_mode and e.st_mode & 0o40000),
-                                        e.filename.lower()))
-            col_w = max(len(e.filename) for e in entries) + 2
-            print(f"  {'TYPE':<5}  {'SIZE':>12}  {'NAME'}")
-            print(f"  {'─'*5}  {'─'*12}  {'─'*col_w}")
-            for e in entries:
-                is_dir = bool(e.st_mode and e.st_mode & 0o40000)
-                ftype  = "DIR"  if is_dir else "FILE"
-                sz     = "-"   if is_dir else f"{e.st_size:,}"
-                print(f"  {ftype:<5}  {sz:>12}  {e.filename}")
-    finally:
-        sftp.close()
-        transport.close()
-
-    print()
-    print("  [SUCCESS] Connection OK – listing complete.")
-    return True
-
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Check SFTP connection through a proxy and list directories.",
+        description="Check SFTP (tries direct first, then proxy) and list directories.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # proxy
     parser.add_argument("--proxy-host", default=os.getenv("PROXY_HOST"))
     parser.add_argument("--proxy-port", type=int, default=int(os.getenv("PROXY_PORT", "0") or 0))
     parser.add_argument("--proxy-user", default=os.getenv("PROXY_USER", ""))
     parser.add_argument("--proxy-pass", default=os.getenv("PROXY_PASS", ""))
     parser.add_argument("--proxy-type", default=os.getenv("PROXY_TYPE", "http"),
-                        choices=["http", "socks4", "socks5"],
-                        help="Proxy protocol (default: http)")
-    # sftp
+                        choices=["http", "socks4", "socks5"])
     parser.add_argument("--sftp-host", default=os.getenv("SFTP_HOST"))
     parser.add_argument("--sftp-port", type=int, default=int(os.getenv("SFTP_PORT", "22") or 22))
     parser.add_argument("--sftp-user", default=os.getenv("SFTP_USER"))
@@ -197,7 +218,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Decide: non-interactive if all required args are supplied
     non_interactive = all([args.proxy_host, args.proxy_port,
                            args.sftp_host, args.sftp_user, args.sftp_pass])
 
@@ -212,26 +232,51 @@ def main():
         sftp_user  = args.sftp_user
         sftp_pass  = args.sftp_pass
     else:
-        # Fall back to interactive prompts
         (ptype_key, proxy_host, proxy_port, proxy_user, proxy_pass,
          sftp_host, sftp_port, sftp_user, sftp_pass) = gather_interactive()
 
-    # Resolve proxy type
     if ptype_key not in PROXY_TYPE_MAP:
         sys.exit(f"[ERROR] Unknown proxy type: {ptype_key}")
     proxy_label, proxy_type = PROXY_TYPE_MAP[ptype_key]
 
-    ok = connect_and_list(
+    # ── STEP 1: try direct ────────────────────────────────────────────────────
+    section("Step 1 — Direct connection (no proxy)")
+    print()
+    ok, entries = try_sftp_direct(sftp_host, sftp_port, sftp_user, sftp_pass)
+
+    if ok:
+        print_listing(entries, "direct")
+        print()
+        print("  [INFO] Proxy is NOT needed from this machine.")
+        print("  [SUCCESS] Done.")
+        if not non_interactive:
+            input("\nPress Enter to exit...")
+        sys.exit(0)
+
+    # ── STEP 2: try via proxy ─────────────────────────────────────────────────
+    section("Step 2 — Direct failed, trying via proxy")
+    print()
+    ok, entries = try_sftp_via_proxy(
         proxy_label, proxy_type,
         proxy_host, proxy_port, proxy_user, proxy_pass,
         sftp_host,  sftp_port,  sftp_user,  sftp_pass,
     )
+
+    if ok:
+        print_listing(entries, "proxy")
+        print()
+        print("  [INFO] Proxy IS required from this machine.")
+        print("  [SUCCESS] Done.")
+    else:
+        print()
+        print("  [FAIL] Both direct and proxy connections failed.")
 
     if not non_interactive:
         print()
         input("Press Enter to exit...")
 
     sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()
