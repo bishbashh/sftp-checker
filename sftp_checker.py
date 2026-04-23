@@ -5,9 +5,26 @@ Mirrors the FileZilla "Generic proxy" + "SFTP site" setup.
 
 Requirements:
     pip install paramiko PySocks
+
+Usage (interactive):
+    python sftp_checker.py
+
+Usage (non-interactive / Routines / CLI):
+    python sftp_checker.py \
+        --proxy-host 195.28.181.203 --proxy-port 6128 \
+        --proxy-user southsurf     --proxy-pass SECRET \
+        --proxy-type http \
+        --sftp-host 85.159.209.22  --sftp-port 8022 \
+        --sftp-user jbbqujnx       --sftp-pass SECRET
+
+Or via environment variables:
+    PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS, PROXY_TYPE
+    SFTP_HOST,  SFTP_PORT,  SFTP_USER,  SFTP_PASS
 """
 
+import argparse
 import getpass
+import os
 import socket
 import sys
 
@@ -21,70 +38,67 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install PySocks")
 
-# ── proxy type labels (matches FileZilla UI order) ───────────────────────────
-PROXY_TYPES = {
-    "1": ("HTTP/1.1 CONNECT", socks.HTTP),
-    "2": ("SOCKS 4",          socks.SOCKS4),
-    "3": ("SOCKS 5",          socks.SOCKS5),
+# ── proxy type map ────────────────────────────────────────────────────────────
+PROXY_TYPE_MAP = {
+    "http":   ("HTTP/1.1 CONNECT", socks.HTTP),
+    "socks4": ("SOCKS 4",          socks.SOCKS4),
+    "socks5": ("SOCKS 5",          socks.SOCKS5),
+    "1":      ("HTTP/1.1 CONNECT", socks.HTTP),
+    "2":      ("SOCKS 4",          socks.SOCKS4),
+    "3":      ("SOCKS 5",          socks.SOCKS5),
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+def section(title: str):
+    print()
+    print(f"─── {title} " + "─" * max(0, 50 - len(title)))
 
 def inp(label: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
     val = input(f"  {label}{suffix}: ").strip()
     return val if val else default
 
-def secret(label: str) -> str:
+def secret_inp(label: str) -> str:
     return getpass.getpass(f"  {label}: ")
-
-def section(title: str):
-    print()
-    print(f"─── {title} " + "─" * (50 - len(title)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def gather_inputs():
+def gather_interactive():
+    """Prompt the user for all credentials (interactive mode)."""
     print()
     print("╔══════════════════════════════════════════════════╗")
     print("║          SFTP Checker  (FileZilla style)         ║")
     print("╚══════════════════════════════════════════════════╝")
 
-    # ── Generic Proxy ────────────────────────────────────────────────────────
     section("Generic Proxy  (Connection → Generic proxy)")
     print()
     print("    Type of generic proxy:")
-    for k, (label, _) in PROXY_TYPES.items():
-        print(f"      {k}. {label}")
+    print("      1. HTTP/1.1 CONNECT")
+    print("      2. SOCKS 4")
+    print("      3. SOCKS 5")
     print()
-    ptype_key = inp("Proxy type", "1")
-    if ptype_key not in PROXY_TYPES:
-        sys.exit("[ERROR] Invalid proxy type selection.")
-    proxy_label, proxy_type = PROXY_TYPES[ptype_key]
-
+    ptype_key  = inp("Proxy type", "1")
     proxy_host = inp("Proxy host")
     proxy_port = int(inp("Proxy port", "8080"))
     proxy_user = inp("Proxy user (leave blank if none)")
-    proxy_pass = secret("Proxy password") if proxy_user else ""
+    proxy_pass = secret_inp("Proxy password") if proxy_user else ""
 
-    # ── SFTP Site ─────────────────────────────────────────────────────────────
     section("SFTP Site  (New Site → SFTP – SSH File Transfer Protocol)")
     sftp_host = inp("Host")
     sftp_port = int(inp("Port", "22"))
     sftp_user = inp("User")
-    sftp_pass = secret("Password")
+    sftp_pass = secret_inp("Password")
 
-    return (
-        proxy_type, proxy_label, proxy_host, proxy_port,
-        proxy_user or None, proxy_pass or None,
-        sftp_host, sftp_port, sftp_user, sftp_pass,
-    )
+    return ptype_key, proxy_host, proxy_port, proxy_user, proxy_pass, \
+           sftp_host, sftp_port, sftp_user, sftp_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def connect_and_list(
-    proxy_type, proxy_label, proxy_host, proxy_port, proxy_user, proxy_pass,
-    sftp_host, sftp_port, sftp_user, sftp_pass,
+    proxy_label, proxy_type,
+    proxy_host, proxy_port, proxy_user, proxy_pass,
+    sftp_host,  sftp_port,  sftp_user,  sftp_pass,
 ):
     section("Connecting")
     print()
@@ -95,7 +109,8 @@ def connect_and_list(
 
     # 1. Proxied socket ────────────────────────────────────────────────────────
     sock = socks.socksocket()
-    sock.set_proxy(proxy_type, proxy_host, proxy_port, True, proxy_user, proxy_pass)
+    sock.set_proxy(proxy_type, proxy_host, proxy_port, True,
+                   proxy_user or None, proxy_pass or None)
     sock.settimeout(20)
 
     print("  [..] Opening proxy tunnel...", end=" ", flush=True)
@@ -141,16 +156,15 @@ def connect_and_list(
         if not entries:
             print("  (empty directory)")
         else:
-            # sort: dirs first, then files, alphabetical
             entries.sort(key=lambda e: (not bool(e.st_mode and e.st_mode & 0o40000),
                                         e.filename.lower()))
             col_w = max(len(e.filename) for e in entries) + 2
             print(f"  {'TYPE':<5}  {'SIZE':>12}  {'NAME'}")
             print(f"  {'─'*5}  {'─'*12}  {'─'*col_w}")
             for e in entries:
-                is_dir  = bool(e.st_mode and e.st_mode & 0o40000)
-                ftype   = "DIR" if is_dir else "FILE"
-                sz      = "-" if is_dir else f"{e.st_size:,}"
+                is_dir = bool(e.st_mode and e.st_mode & 0o40000)
+                ftype  = "DIR"  if is_dir else "FILE"
+                sz     = "-"   if is_dir else f"{e.st_size:,}"
                 print(f"  {ftype:<5}  {sz:>12}  {e.filename}")
     finally:
         sftp.close()
@@ -163,10 +177,61 @@ def connect_and_list(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = gather_inputs()
-    connect_and_list(*args)
-    print()
-    input("Press Enter to exit...")
+    parser = argparse.ArgumentParser(
+        description="Check SFTP connection through a proxy and list directories.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # proxy
+    parser.add_argument("--proxy-host", default=os.getenv("PROXY_HOST"))
+    parser.add_argument("--proxy-port", type=int, default=int(os.getenv("PROXY_PORT", "0") or 0))
+    parser.add_argument("--proxy-user", default=os.getenv("PROXY_USER", ""))
+    parser.add_argument("--proxy-pass", default=os.getenv("PROXY_PASS", ""))
+    parser.add_argument("--proxy-type", default=os.getenv("PROXY_TYPE", "http"),
+                        choices=["http", "socks4", "socks5"],
+                        help="Proxy protocol (default: http)")
+    # sftp
+    parser.add_argument("--sftp-host", default=os.getenv("SFTP_HOST"))
+    parser.add_argument("--sftp-port", type=int, default=int(os.getenv("SFTP_PORT", "22") or 22))
+    parser.add_argument("--sftp-user", default=os.getenv("SFTP_USER"))
+    parser.add_argument("--sftp-pass", default=os.getenv("SFTP_PASS"))
+
+    args = parser.parse_args()
+
+    # Decide: non-interactive if all required args are supplied
+    non_interactive = all([args.proxy_host, args.proxy_port,
+                           args.sftp_host, args.sftp_user, args.sftp_pass])
+
+    if non_interactive:
+        ptype_key  = args.proxy_type
+        proxy_host = args.proxy_host
+        proxy_port = args.proxy_port
+        proxy_user = args.proxy_user
+        proxy_pass = args.proxy_pass
+        sftp_host  = args.sftp_host
+        sftp_port  = args.sftp_port
+        sftp_user  = args.sftp_user
+        sftp_pass  = args.sftp_pass
+    else:
+        # Fall back to interactive prompts
+        (ptype_key, proxy_host, proxy_port, proxy_user, proxy_pass,
+         sftp_host, sftp_port, sftp_user, sftp_pass) = gather_interactive()
+
+    # Resolve proxy type
+    if ptype_key not in PROXY_TYPE_MAP:
+        sys.exit(f"[ERROR] Unknown proxy type: {ptype_key}")
+    proxy_label, proxy_type = PROXY_TYPE_MAP[ptype_key]
+
+    ok = connect_and_list(
+        proxy_label, proxy_type,
+        proxy_host, proxy_port, proxy_user, proxy_pass,
+        sftp_host,  sftp_port,  sftp_user,  sftp_pass,
+    )
+
+    if not non_interactive:
+        print()
+        input("Press Enter to exit...")
+
+    sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
     main()
