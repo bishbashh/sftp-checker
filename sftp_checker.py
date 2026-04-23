@@ -176,27 +176,40 @@ def gather_interactive():
     print("║          SFTP Checker  (FileZilla style)         ║")
     print("╚══════════════════════════════════════════════════╝")
 
-    section("Generic Proxy  (Connection → Generic proxy)")
-    print()
-    print("    Type of generic proxy:")
-    print("      1. HTTP/1.1 CONNECT")
-    print("      2. SOCKS 4")
-    print("      3. SOCKS 5")
-    print()
-    ptype_key  = inp("Proxy type", "1")
-    proxy_host = inp("Proxy host")
-    proxy_port = int(inp("Proxy port", "8080"))
-    proxy_user = inp("Proxy user (leave blank if none)")
-    proxy_pass = secret_inp("Proxy password") if proxy_user else ""
-
+    # ── SFTP credentials first ────────────────────────────────────────────────
     section("SFTP Site  (New Site → SFTP – SSH File Transfer Protocol)")
     sftp_host = inp("Host")
     sftp_port = int(inp("Port", "22"))
     sftp_user = inp("User")
     sftp_pass = secret_inp("Password")
 
+    # ── Ask about proxy ───────────────────────────────────────────────────────
+    print()
+    use_proxy = input("  Do you want to use a proxy? (y/n) [n]: ").strip().lower()
+    use_proxy = use_proxy in ("y", "yes")
+
+    ptype_key  = None
+    proxy_host = None
+    proxy_port = 0
+    proxy_user = ""
+    proxy_pass = ""
+
+    if use_proxy:
+        section("Generic Proxy  (Connection → Generic proxy)")
+        print()
+        print("    Type of generic proxy:")
+        print("      1. HTTP/1.1 CONNECT")
+        print("      2. SOCKS 4")
+        print("      3. SOCKS 5")
+        print()
+        ptype_key  = inp("Proxy type", "1")
+        proxy_host = inp("Proxy host")
+        proxy_port = int(inp("Proxy port", "8080"))
+        proxy_user = inp("Proxy user (leave blank if none)")
+        proxy_pass = secret_inp("Proxy password") if proxy_user else ""
+
     return ptype_key, proxy_host, proxy_port, proxy_user, proxy_pass, \
-           sftp_host, sftp_port, sftp_user, sftp_pass
+           sftp_host, sftp_port, sftp_user, sftp_pass, use_proxy
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -231,45 +244,37 @@ def main():
         sftp_port  = args.sftp_port
         sftp_user  = args.sftp_user
         sftp_pass  = args.sftp_pass
+        use_proxy  = bool(proxy_host and proxy_port)
     else:
         (ptype_key, proxy_host, proxy_port, proxy_user, proxy_pass,
-         sftp_host, sftp_port, sftp_user, sftp_pass) = gather_interactive()
+         sftp_host, sftp_port, sftp_user, sftp_pass, use_proxy) = gather_interactive()
 
-    if ptype_key not in PROXY_TYPE_MAP:
-        sys.exit(f"[ERROR] Unknown proxy type: {ptype_key}")
-    proxy_label, proxy_type = PROXY_TYPE_MAP[ptype_key]
+    if use_proxy:
+        if ptype_key not in PROXY_TYPE_MAP:
+            sys.exit(f"[ERROR] Unknown proxy type: {ptype_key}")
+        proxy_label, proxy_type = PROXY_TYPE_MAP[ptype_key]
 
-    # ── STEP 1: try direct ────────────────────────────────────────────────────
-    section("Step 1 — Direct connection (no proxy)")
-    print()
-    ok, entries = try_sftp_direct(sftp_host, sftp_port, sftp_user, sftp_pass)
+        # ── Connect via proxy ─────────────────────────────────────────────────
+        section("Connecting via Proxy")
+        print()
+        ok, entries = try_sftp_via_proxy(
+            proxy_label, proxy_type,
+            proxy_host, proxy_port, proxy_user, proxy_pass,
+            sftp_host,  sftp_port,  sftp_user,  sftp_pass,
+        )
+    else:
+        # ── Connect direct ────────────────────────────────────────────────────
+        section("Connecting Direct (no proxy)")
+        print()
+        ok, entries = try_sftp_direct(sftp_host, sftp_port, sftp_user, sftp_pass)
 
     if ok:
-        print_listing(entries, "direct")
+        print_listing(entries, "proxy" if use_proxy else "direct")
         print()
-        print("  [INFO] Proxy is NOT needed from this machine.")
-        print("  [SUCCESS] Done.")
-        if not non_interactive:
-            input("\nPress Enter to exit...")
-        sys.exit(0)
-
-    # ── STEP 2: try via proxy ─────────────────────────────────────────────────
-    section("Step 2 — Direct failed, trying via proxy")
-    print()
-    ok, entries = try_sftp_via_proxy(
-        proxy_label, proxy_type,
-        proxy_host, proxy_port, proxy_user, proxy_pass,
-        sftp_host,  sftp_port,  sftp_user,  sftp_pass,
-    )
-
-    if ok:
-        print_listing(entries, "proxy")
-        print()
-        print("  [INFO] Proxy IS required from this machine.")
         print("  [SUCCESS] Done.")
     else:
         print()
-        print("  [FAIL] Both direct and proxy connections failed.")
+        print("  [FAIL] Connection failed.")
 
     if not non_interactive:
         print()
